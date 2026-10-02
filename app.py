@@ -52,6 +52,134 @@ def carregar_dados():
     return alunos, edps
 
 
+def carregar_compras_excel():
+    """Carrega as compras permanentes da aba Compras, se ela existir."""
+    if not ARQUIVO.exists():
+        return []
+
+    try:
+        wb = load_workbook(ARQUIVO, read_only=True, data_only=True)
+        if "Compras" not in wb.sheetnames:
+            wb.close()
+            return []
+
+        ws = wb["Compras"]
+        valores = list(ws.iter_rows(values_only=True))
+        wb.close()
+
+        if not valores:
+            return []
+
+        cabecalho = [str(v).strip() if v is not None else "" for v in valores[0]]
+        registros = []
+        for linha in valores[1:]:
+            if not any(v is not None and str(v).strip() != "" for v in linha):
+                continue
+            registro = dict(zip(cabecalho, linha))
+            if registro.get("Comprador ID") is None or registro.get("Código") is None:
+                continue
+            try:
+                registro["Comprador ID"] = int(registro["Comprador ID"])
+            except (TypeError, ValueError):
+                pass
+            if "Preço" in registro and registro["Preço"] is not None:
+                try:
+                    registro["Preço"] = float(registro["Preço"])
+                except (TypeError, ValueError):
+                    pass
+            registros.append(registro)
+
+        return registros
+
+    except Exception as e:
+        st.error(f"❌ Erro ao carregar a aba Compras: {e}")
+        return []
+
+
+def registrar_compras_excel(compras_novas):
+    """Grava um lote de compras na aba Compras, criando a aba se necessário."""
+    if not compras_novas:
+        return True
+
+    colunas = [
+        "ID compra",
+        "Comprador ID",
+        "Comprador",
+        "Vendedor",
+        "Código",
+        "EDP",
+        "Etapa",
+        "Preço",
+        "Data/hora",
+    ]
+
+    try:
+        wb = load_workbook(ARQUIVO)
+
+        if "Compras" not in wb.sheetnames:
+            ws = wb.create_sheet("Compras")
+            for col_idx, coluna in enumerate(colunas, start=1):
+                ws.cell(row=1, column=col_idx, value=coluna)
+        else:
+            ws = wb["Compras"]
+            # Garante um cabeçalho compatível caso a aba já exista.
+            cabecalho_existente = [
+                ws.cell(row=1, column=c).value
+                for c in range(1, ws.max_column + 1)
+            ]
+            cabecalho_existente = [
+                str(v).strip() if v is not None else ""
+                for v in cabecalho_existente
+            ]
+            if cabecalho_existente != colunas:
+                # Mantém dados existentes, mas adiciona/organiza as colunas esperadas.
+                dados_existentes = list(ws.iter_rows(min_row=2, values_only=True))
+                wb.remove(ws)
+                ws = wb.create_sheet("Compras")
+                for col_idx, coluna in enumerate(colunas, start=1):
+                    ws.cell(row=1, column=col_idx, value=coluna)
+                for linha in dados_existentes:
+                    registro = dict(zip(cabecalho_existente, linha))
+                    nova_linha = [registro.get(c) for c in colunas]
+                    ws.append(nova_linha)
+
+        # Define o próximo ID de compra.
+        ids = []
+        for valor in ws.iter_rows(min_row=2, min_col=1, max_col=1, values_only=True):
+            v = valor[0]
+            if isinstance(v, (int, float)):
+                ids.append(int(v))
+        proximo_id = max(ids, default=0) + 1
+
+        agora = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        for compra in compras_novas:
+            ws.append([
+                proximo_id,
+                compra["Comprador ID"],
+                compra["Comprador"],
+                compra["Vendedor"],
+                compra["Código"],
+                compra["EDP"],
+                compra["Etapa"],
+                compra["Preço"],
+                agora,
+            ])
+            proximo_id += 1
+
+        wb.save(ARQUIVO)
+        return True
+
+    except PermissionError:
+        st.error(
+            "❌ Não foi possível registrar as compras no Excel. "
+            "Feche o arquivo EDP_MARKET.xlsx caso ele esteja aberto no Excel."
+        )
+        return False
+    except Exception as e:
+        st.error(f"❌ Erro ao registrar as compras no Excel: {e}")
+        return False
+
+
 def salvar_aba(df, nome_aba):
     """Atualiza apenas uma aba do Excel, preservando as demais."""
     if not ARQUIVO.exists():
@@ -148,6 +276,12 @@ if alunos is None or edps is None:
 # Não altera a compra nem o orçamento; será usado futuramente na pontuação.
 if "entregas_edp" not in st.session_state:
     st.session_state.entregas_edp = {}
+
+# Carrega as compras permanentes do Excel uma única vez por sessão.
+# Assim, as compras continuam disponíveis após reruns/reinício do Streamlit.
+if "compras_carregadas" not in st.session_state:
+    st.session_state.compras = carregar_compras_excel()
+    st.session_state.compras_carregadas = True
 
 edp_lookup = (
     edps.drop_duplicates("Código")
@@ -386,8 +520,7 @@ elif menu == "🛒 Mercado":
         with c1:
             st.markdown(f"### {codigo_vendedor}")
             st.write(f"**EDP:** {info_vendedor['EDP']}")
-            st.write(f"**Etapa:** {info_vendedor['Etapa']}")
-
+            
         edp_atual = edps[edps["Código"] == codigo_vendedor].iloc[0]
         status_atual = str(edp_atual["Status"] or "Não anunciado").strip()
 
@@ -465,7 +598,7 @@ elif menu == "🛒 Mercado":
             vendedor_edp = str(linha["Vendedor"])
             preco_edp = float(linha["Preço"])
             opcoes_edp[codigo] = (
-                f"{codigo} — {linha['EDP']} | {linha['Etapa']} | "
+                f"{codigo} — {linha['EDP']} | "
                 f"{preco_edp:.0f} EC | {vendedor_edp}"
             )
 
@@ -483,12 +616,10 @@ elif menu == "🛒 Mercado":
         st.markdown(
             f"### {codigo_compra} — {edp_venda['EDP']}"
         )
-        c1, c2, c3 = st.columns(3)
+        c1, c2 = st.columns(2)
         with c1:
-            st.write(f"**Etapa:** {edp_venda['Etapa']}")
-        with c2:
             st.write(f"**Vendedor:** {vendedor_edp}")
-        with c3:
+        with c2:
             st.write(f"**Preço:** {preco_edp:.0f} EcoCoins")
 
         nomes_compradores = [
@@ -521,7 +652,7 @@ elif menu == "🛒 Mercado":
                 for c in st.session_state.compras
             }
 
-            registrados = 0
+            compras_novas = []
             ignorados = 0
 
             for nome_comprador in compradores_selecionados:
@@ -538,7 +669,7 @@ elif menu == "🛒 Mercado":
                 # O orçamento NÃO bloqueia a compra.
                 # O sistema apenas acumula o valor gasto para o controle
                 # do professor. O saldo pode ficar negativo.
-                st.session_state.compras.append({
+                compras_novas.append({
                     "Comprador ID": comprador_id,
                     "Comprador": nome_comprador,
                     "Vendedor": vendedor_edp,
@@ -547,12 +678,17 @@ elif menu == "🛒 Mercado":
                     "Etapa": str(edp_venda["Etapa"]),
                     "Preço": preco_edp
                 })
-                registrados += 1
 
+            registrados = len(compras_novas)
+
+            # Primeiro grava no Excel. Só adiciona à sessão se a gravação
+            # permanente tiver sido concluída com sucesso.
             if registrados > 0:
-                st.success(
-                    f"✅ {registrados} compra(s) registrada(s) para {codigo_compra}."
-                )
+                sucesso_compras = registrar_compras_excel(compras_novas)
+                if sucesso_compras:
+                    st.session_state.compras.extend(compras_novas)
+                else:
+                    registrados = 0
             if ignorados > 0:
                 st.warning(
                     f"⚠️ {ignorados} seleção(ões) não foram registradas "
@@ -594,8 +730,8 @@ elif menu == "🛒 Mercado":
     st.subheader("💰 Controle de orçamento — professor")
     st.caption(
         "Controle interno da simulação. Os valores abaixo são calculados "
-        "a partir das compras registradas nesta sessão e ainda não alteram "
-        "o saldo gravado no Excel."
+        "a partir das compras registradas na aba Compras e ainda não alteram "
+        "o saldo-base gravado na aba Alunos."
     )
 
     total_gasto = controle["Gasto acumulado"].sum()
@@ -642,13 +778,13 @@ elif menu == "🛒 Mercado":
     st.divider()
     st.subheader("👤 Compras de cada aluno")
     st.caption(
-        "Consulta das compras registradas nesta sessão. "
+        "Consulta das compras registradas. "
         "A seleção abaixo permite acompanhar o portfólio de cada aluno "
         "sem alterar nenhuma compra."
     )
 
     if "compras" not in st.session_state or len(st.session_state.compras) == 0:
-        st.info("Ainda não há compras registradas nesta sessão.")
+        st.info("Ainda não há compras registradas.")
     else:
         compras_alunos = pd.DataFrame(st.session_state.compras)
 
@@ -694,7 +830,6 @@ elif menu == "🛒 Mercado":
                     [
                         "Código",
                         "EDP",
-                        "Etapa",
                         "Vendedor",
                         "Preço"
                     ]
@@ -709,31 +844,7 @@ elif menu == "🛒 Mercado":
                 }
             )
 
-            st.write("**Resumo por etapa do ciclo de vida:**")
 
-            resumo_etapas = (
-                compras_aluno
-                .groupby("Etapa")
-                .agg(
-                    **{
-                        "Quantidade de EDPs": ("Código", "count"),
-                        "Valor gasto": ("Preço", "sum")
-                    }
-                )
-                .reset_index()
-            )
-
-            st.dataframe(
-                resumo_etapas,
-                use_container_width=True,
-                hide_index=True,
-                column_config={
-                    "Valor gasto": st.column_config.NumberColumn(
-                        "Valor gasto",
-                        format="%.0f EC"
-                    )
-                }
-            )
 
     # --------------------------------------------------------
     # CONTROLE DE ENTREGA DOS EDPs — PROFESSOR
@@ -767,7 +878,7 @@ elif menu == "🛒 Mercado":
 
             with c2:
                 st.write(
-                    f"**{linha_entrega['EDP']}**"
+                    f"**{linha_entrega['EDP']}**  "
                     f"Vendedor: {linha_entrega['Vendedor']} | "
                     f"Preço: {float(linha_entrega['Preço']):.0f} EC"
                 )
@@ -790,7 +901,7 @@ elif menu == "🛒 Mercado":
                 st.session_state.entregas_edp[codigo_entrega] = novo_status
 
     # --------------------------------------------------------
-    # COMPRAS DA SESSÃO
+    # COMPRAS REGISTRADAS
     # --------------------------------------------------------
 
     if "compras" in st.session_state and len(st.session_state.compras) > 0:
@@ -798,11 +909,11 @@ elif menu == "🛒 Mercado":
         compras = pd.DataFrame(st.session_state.compras)
 
         st.divider()
-        st.subheader("📦 Compras registradas nesta sessão")
+        st.subheader("📦 Compras registradas")
 
         st.dataframe(
             compras[
-                ["Comprador", "Código", "EDP", "Etapa", "Vendedor", "Preço"]
+                ["Comprador", "Código", "EDP", "Vendedor", "Preço"]
             ],
             use_container_width=True,
             hide_index=True
@@ -822,10 +933,10 @@ elif menu == "🛒 Mercado":
             )
             st.metric("EDPs entregues corretamente", entregues)
 
-        st.warning(
-            "ℹ️ Nesta etapa, as compras ainda ficam somente na sessão do "
-            "Streamlit. O próximo módulo será a gravação permanente das "
-            "compras e o desconto automático do saldo."
+        st.success(
+            "💾 As compras desta turma estão gravadas permanentemente na aba "
+            "**Compras** do arquivo EDP_MARKET.xlsx. O registro também é "
+            "recarregado automaticamente quando o aplicativo é reiniciado."
         )
 
 
@@ -855,7 +966,7 @@ elif menu == "📊 Portfólio":
 
     if "compras" not in st.session_state or len(st.session_state.compras) == 0:
         st.info(
-            "Ainda não há compras registradas nesta sessão. "
+            "Ainda não há compras registradas. "
             "O portfólio será preenchido automaticamente após as compras."
         )
     else:
