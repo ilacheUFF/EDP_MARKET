@@ -8,6 +8,8 @@ from openpyxl import load_workbook
 from datetime import datetime
 
 ARQUIVO = Path("EDP_MARKET.xlsx")
+ARQUIVO_FORMULARIO = Path("Respostas.xlsx")
+LIMITE_ERRO = 200  # acerto quando |resposta - gabarito| < 200
 
 st.set_page_config(
     page_title="EDP Market",
@@ -262,6 +264,217 @@ def atualizar_edp_no_excel(codigo, vendedor, preco):
         return False
 
 
+
+# ============================================================
+# VALIDAÇÃO DAS RESPOSTAS DO FORMULÁRIO
+# ============================================================
+
+def validar_respostas_formulario():
+    """
+    Cruza as respostas do formulário com a aba Gabarito pelo EDP.
+
+    Formulário:
+        D = EDP
+        E:G = resultados respondidos
+
+    Gabarito:
+        C = EDP
+        E:G = valores corretos do gabarito (NÃO são alterados)
+        H = Respostas acertadas
+
+    O valor inicial de H é -1, significando "ainda não validado".
+    Somente depois que a validação for executada H pode ser alterado
+    para 1, 2 ou 3, conforme a quantidade de resultados corretos.
+
+    Um resultado é considerado correto quando:
+        abs(resposta - gabarito) < LIMITE_ERRO
+    """
+    if not ARQUIVO_FORMULARIO.exists():
+        return None, "Arquivo de respostas do formulário não encontrado."
+
+    try:
+        respostas = pd.read_excel(
+            ARQUIVO_FORMULARIO,
+            sheet_name=0
+        )
+
+        colunas_form = list(respostas.columns)
+        if len(colunas_form) < 7:
+            return None, "O formulário não possui as colunas esperadas D:G."
+
+        # Usa exatamente D:G pela posição, independentemente do texto do cabeçalho.
+        respostas = respostas.iloc[:, [3, 4, 5, 6]].copy()
+        respostas.columns = ["EDP", "Preprodu", "Distribui", "Descarte"]
+
+        def normalizar_edp(valor):
+            if pd.isna(valor):
+                return ""
+            try:
+                return f"P{int(float(valor)):02d}"
+            except (TypeError, ValueError):
+                return str(valor).strip().upper()
+
+        respostas["EDP"] = respostas["EDP"].apply(normalizar_edp)
+
+        for col in ["Preprodu", "Distribui", "Descarte"]:
+            respostas[col] = pd.to_numeric(respostas[col], errors="coerce")
+
+        # Se houver mais de uma resposta para o mesmo EDP,
+        # usa a resposta mais recente do formulário.
+        respostas = respostas.drop_duplicates("EDP", keep="last")
+
+        # Workbook com fórmulas preservadas para gravação.
+        wb = load_workbook(ARQUIVO)
+
+        if "Gabarito" not in wb.sheetnames:
+            wb.close()
+            return None, "A aba Gabarito não foi encontrada no EDP_MARKET.xlsx."
+
+        ws = wb["Gabarito"]
+
+        def calcular_gabarito(formula, linha):
+            """
+            Calcula o valor de uma fórmula simples do Excel quando o
+            openpyxl não possui o resultado calculado em cache.
+
+            O Gabarito atual usa fórmulas aritméticas baseadas na coluna D
+            (CPF), por exemplo:
+                =D2*400*10
+                =D2*500*0.001*10*140
+                =D2*10*4.1
+
+            Mantemos a fórmula na planilha e calculamos apenas seu valor
+            para fazer a validação.
+            """
+            if formula is None:
+                return None
+
+            if isinstance(formula, (int, float)):
+                return float(formula)
+
+            formula = str(formula).strip()
+
+            if not formula.startswith("="):
+                try:
+                    return float(formula)
+                except (TypeError, ValueError):
+                    return None
+
+            expressao = formula[1:].strip()
+
+            # Substitui referências simples de células pelos respectivos
+            # valores da mesma linha/planilha.
+            import re
+
+            def substituir_celula(match):
+                referencia = match.group(0)
+                valor = ws[referencia].value
+                if valor is None:
+                    raise ValueError(f"Célula {referencia} sem valor.")
+                return str(float(valor))
+
+            try:
+                expressao = re.sub(
+                    r"\$?[A-Z]{1,3}\$?\d+",
+                    substituir_celula,
+                    expressao
+                )
+
+                # Aceita somente números, operadores e parênteses.
+                if not re.fullmatch(r"[0-9eE+\-*/(). ]+", expressao):
+                    return None
+
+                return float(eval(expressao, {"__builtins__": {}}, {}))
+            except (TypeError, ValueError, SyntaxError, ZeroDivisionError):
+                return None
+
+        cabecalho = {
+            str(ws.cell(row=1, column=c).value).strip(): c
+            for c in range(1, ws.max_column + 1)
+            if ws.cell(row=1, column=c).value is not None
+        }
+
+        col_codigo = cabecalho.get("EDP atribuído", 3)  # coluna C
+        col_acertos = cabecalho.get("Respostas acertadas", 8)  # coluna H
+
+        # Garante que o cabeçalho exista, sem alterar as colunas E:G.
+        ws.cell(row=1, column=col_acertos, value="Respostas acertadas")
+
+        mapa_respostas = respostas.set_index("EDP").to_dict("index")
+        detalhes = []
+
+        for linha in range(2, ws.max_row + 1):
+            edp = normalizar_edp(ws.cell(linha, col_codigo).value)
+            resposta = mapa_respostas.get(edp)
+
+            # O valor do gabarito em E:G é lido SOMENTE de ws_valores.
+            # Nunca escrevemos nas colunas E:G.
+            acertos = 0
+            respostas_encontradas = 0
+
+            if resposta is not None:
+                for col_idx, nome_col in zip(
+                    [5, 6, 7],
+                    ["Preprodu", "Distribui", "Descarte"]
+                ):
+                    valor_resposta = resposta[nome_col]
+
+                    if pd.isna(valor_resposta):
+                        continue
+
+                    respostas_encontradas += 1
+
+                    try:
+                        formula_gabarito = ws.cell(linha, col_idx).value
+                        gab = calcular_gabarito(formula_gabarito, linha)
+
+                        if gab is not None and abs(float(valor_resposta) - gab) < LIMITE_ERRO:
+                            acertos += 1
+                    except (TypeError, ValueError):
+                        pass
+
+            # H começa em -1 e só muda quando esta rotina de validação
+            # efetivamente analisa o EDP.
+            #
+            # Conforme solicitado:
+            #   - 1, 2 ou 3 = quantidade de acertos;
+            #   - -1 = nenhum acerto / ainda sem resultado positivo.
+            #
+            # As colunas E:G permanecem intactas.
+            if resposta is not None and respostas_encontradas > 0 and acertos > 0:
+                ws.cell(linha, col_acertos, acertos)
+            else:
+                ws.cell(linha, col_acertos, -1)
+
+            detalhes.append({
+                "EDP": edp,
+                "Respostas enviadas": respostas_encontradas,
+                "Respostas acertadas": (
+                    acertos if (resposta is not None and respostas_encontradas > 0)
+                    else -1
+                ),
+                "Situação": (
+                    "3/3" if acertos == 3 else
+                    "2/3" if acertos == 2 else
+                    "1/3" if acertos == 1 else
+                    "Não validado / nenhum acerto"
+                )
+            })
+
+        wb.save(ARQUIVO)
+        wb.close()
+
+        return pd.DataFrame(detalhes), None
+
+    except PermissionError:
+        return None, (
+            "Não foi possível atualizar o Excel. "
+            "Feche o EDP_MARKET.xlsx caso ele esteja aberto."
+        )
+    except Exception as e:
+        return None, f"Erro ao validar respostas: {e}"
+
+
 # ============================================================
 # CARREGAMENTO
 # ============================================================
@@ -298,7 +511,7 @@ alunos["Etapa automática"] = alunos["EDP atribuído"].map(
 
 menu = st.sidebar.radio(
     "Navegação",
-    ["🎮 Início", "👥 Alunos", "🌱 EDPs", "🛒 Mercado", "📊 Portfólio"]
+    ["🎮 Início", "👥 Alunos", "🌱 EDPs", "🛒 Mercado", "📊 Portfólio", "✅ Validação"]
 )
 
 
@@ -939,6 +1152,56 @@ elif menu == "🛒 Mercado":
             "recarregado automaticamente quando o aplicativo é reiniciado."
         )
 
+
+elif menu == "✅ Validação":
+    st.title("✅ Validação das respostas")
+    st.subheader("Comparação com o gabarito")
+
+    st.info(
+        "O EDP é usado como chave de comparação. "
+        "Para cada EDP, os três resultados do formulário são comparados "
+        "com as três respostas da aba Gabarito."
+    )
+
+    st.write(
+        f"**Critério de acerto:** erro absoluto menor que **{LIMITE_ERRO}**."
+    )
+    st.caption(
+        "Quando um EDP não aparece nas respostas dos alunos, "
+        "as respostas são registradas como -1 (não enviada)."
+    )
+
+    if st.button("🔄 VALIDAR RESPOSTAS", type="primary"):
+        resultado, erro = validar_respostas_formulario()
+
+        if erro:
+            st.error(erro)
+        else:
+            st.success(
+                "✅ Validação concluída e a coluna **Respostas acertadas** "
+                "foi atualizada na aba Gabarito."
+            )
+            st.dataframe(
+                resultado,
+                use_container_width=True,
+                hide_index=True
+            )
+
+            total_3 = int((resultado["Respostas acertadas"] == 3).sum())
+            total_2 = int((resultado["Respostas acertadas"] == 2).sum())
+            total_1 = int((resultado["Respostas acertadas"] == 1).sum())
+            total_0 = int((resultado["Respostas acertadas"] == 0).sum())
+
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("3/3", total_3)
+            c2.metric("2/3", total_2)
+            c3.metric("1/3", total_1)
+            c4.metric("0/3", total_0)
+
+            st.caption(
+                "A coluna Respostas acertadas é gravada permanentemente "
+                "na aba Gabarito do EDP_MARKET.xlsx."
+            )
 
 elif menu == "📊 Portfólio":
     st.title("📊 Portfólio dos alunos")
