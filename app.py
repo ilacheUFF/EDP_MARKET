@@ -1,4 +1,5 @@
 import streamlit as st
+import re
 
 # CONTROLE DE ORÇAMENTO — compras podem ultrapassar 1000 EC
 
@@ -9,6 +10,7 @@ from datetime import datetime
 
 ARQUIVO = Path("EDP_MARKET.xlsx")
 ARQUIVO_FORMULARIO = Path("Respostas.xlsx")
+ARQUIVO_SELECOES = Path("RegistroEDP.xlsx")
 LIMITE_ERRO = 200  # acerto quando |resposta - gabarito| < 200
 
 st.set_page_config(
@@ -266,6 +268,143 @@ def atualizar_edp_no_excel(codigo, vendedor, preco):
 
 
 # ============================================================
+# LEITURA DAS ESCOLHAS DE EDPs DOS ALUNOS
+# ============================================================
+
+@st.cache_data
+def carregar_selecoes_edps():
+    """
+    Lê o arquivo exportado pelo formulário de compras dos EDPs.
+
+    Pela estrutura atual:
+        Coluna C = nome do aluno
+        Coluna D = EDP apresentado pelo aluno
+        Coluna E = EDPs/princípios escolhidos pelo aluno
+
+    A coluna E contém códigos Pxx. A função extrai os códigos,
+    consulta o preço de cada EDP na aba "EDPs" do EDP_MARKET.xlsx
+    e calcula a pontuação de cada princípio.
+    """
+    if not ARQUIVO_SELECOES.exists():
+        return pd.DataFrame(), pd.DataFrame(), "Arquivo de seleções não encontrado."
+
+    try:
+        df = pd.read_excel(ARQUIVO_SELECOES, sheet_name=0)
+
+        if df.shape[1] < 5:
+            return pd.DataFrame(), pd.DataFrame(), (
+                "O arquivo de seleções não possui as colunas C, D e E esperadas."
+            )
+
+        selecoes = df.iloc[:, [2, 3, 4]].copy()
+        selecoes.columns = ["Aluno", "EDP apresentado", "Princípios escolhidos"]
+
+        def normalizar_codigo(valor):
+            if pd.isna(valor) or str(valor).strip() == "":
+                return ""
+            try:
+                return f"P{int(float(valor)):02d}"
+            except (TypeError, ValueError):
+                texto = str(valor).strip().upper()
+                if texto.startswith("P"):
+                    try:
+                        return f"P{int(texto[1:]):02d}"
+                    except (TypeError, ValueError):
+                        return texto
+                return texto
+
+        selecoes["EDP apresentado"] = selecoes["EDP apresentado"].apply(
+            normalizar_codigo
+        )
+
+        def extrair_principios(valor):
+            if pd.isna(valor):
+                return []
+            return re.findall(r"\bP\d{2}\b", str(valor).upper())
+
+        selecoes["Princípios escolhidos"] = selecoes[
+            "Princípios escolhidos"
+        ].apply(extrair_principios)
+
+        selecoes["Quantidade"] = selecoes["Princípios escolhidos"].apply(len)
+
+        # Busca os preços diretamente na aba EDPs do EDP_MARKET.xlsx.
+        _, edps = carregar_dados()
+
+        precos = {}
+        if edps is not None and not edps.empty:
+            for _, linha in edps.iterrows():
+                codigo = normalizar_codigo(linha.get("Código", ""))
+                if not codigo:
+                    continue
+                try:
+                    preco = float(linha.get("Preço"))
+                    if pd.isna(preco):
+                        preco = 0.0
+                except (TypeError, ValueError):
+                    preco = 0.0
+                precos[codigo] = preco
+
+        # Regra de pontuação solicitada.
+        principios_1_ponto = {"P24", "P37"}
+        principios_5_pontos = {"P22", "P39", "P41", "P60", "P30", "P02", "P46"}
+
+        def pontos_principio(codigo):
+            if codigo in principios_1_ponto:
+                return 1
+            if codigo in principios_5_pontos:
+                return 5
+            return 2
+
+        registros = []
+        for _, linha in selecoes.iterrows():
+            for principio in linha["Princípios escolhidos"]:
+                registros.append({
+                    "Aluno": linha["Aluno"],
+                    "EDP apresentado": linha["EDP apresentado"],
+                    "Princípio": principio,
+                    "Valor": precos.get(principio, 0.0),
+                    "Pontuação": pontos_principio(principio),
+                })
+
+        detalhado = pd.DataFrame(
+            registros,
+            columns=[
+                "Aluno",
+                "EDP apresentado",
+                "Princípio",
+                "Valor",
+                "Pontuação",
+            ]
+        )
+
+        if len(detalhado) > 0:
+            totais = (
+                detalhado.groupby("Aluno", dropna=False)
+                .agg(
+                    **{
+                        "Valor gasto": ("Valor", "sum"),
+                        "Pontuação": ("Pontuação", "sum"),
+                    }
+                )
+                .reset_index()
+            )
+        else:
+            totais = pd.DataFrame(
+                columns=["Aluno", "Valor gasto", "Pontuação"]
+            )
+
+        selecoes = selecoes.merge(totais, on="Aluno", how="left")
+        selecoes["Valor gasto"] = selecoes["Valor gasto"].fillna(0.0)
+        selecoes["Pontuação"] = selecoes["Pontuação"].fillna(0).astype(int)
+
+        return selecoes, detalhado, ""
+
+    except Exception as e:
+        return pd.DataFrame(), pd.DataFrame(), f"Erro ao ler as seleções: {e}"
+
+
+# ============================================================
 # VALIDAÇÃO DAS RESPOSTAS DO FORMULÁRIO
 # ============================================================
 
@@ -511,7 +650,7 @@ alunos["Etapa automática"] = alunos["EDP atribuído"].map(
 
 menu = st.sidebar.radio(
     "Navegação",
-    ["🎮 Início", "👥 Alunos", "🌱 EDPs", "🛒 Mercado", "📊 Portfólio", "✅ Validação"]
+    ["🎮 Início", "👥 Alunos", "🌱 EDPs", "🛒 Mercado", "📊 Portfólio", "🧩 Princípios escolhidos", "✅ Validação"]
 )
 
 
@@ -1153,54 +1292,150 @@ elif menu == "🛒 Mercado":
         )
 
 
-elif menu == "✅ Validação":
-    st.title("✅ Validação das respostas")
-    st.subheader("Comparação com o gabarito")
 
-    st.info(
-        "O EDP é usado como chave de comparação. "
-        "Para cada EDP, os três resultados do formulário são comparados "
-        "com as três respostas da aba Gabarito."
-    )
-
-    st.write(
-        f"**Critério de acerto:** erro absoluto menor que **{LIMITE_ERRO}**."
-    )
+elif menu == "🧩 Princípios escolhidos":
+    st.title("🧩 Princípios escolhidos pelos alunos")
     st.caption(
-        "Quando um EDP não aparece nas respostas dos alunos, "
-        "as respostas são registradas como -1 (não enviada)."
+        "Os valores são buscados na coluna 'Preço' da aba 'EDPs' do "
+        "EDP_MARKET.xlsx. A pontuação segue a regra definida para cada EDP."
     )
 
-    if st.button("🔄 VALIDAR RESPOSTAS", type="primary"):
-        resultado, erro = validar_respostas_formulario()
+    selecoes, detalhado, erro_selecoes = carregar_selecoes_edps()
 
-        if erro:
-            st.error(erro)
-        else:
+    if erro_selecoes:
+        st.error(f"❌ {erro_selecoes}")
+    elif isinstance(selecoes, pd.DataFrame) and len(selecoes) > 0:
+        total_alunos = len(selecoes)
+        total_escolhas = int(selecoes["Quantidade"].sum())
+        principios_unicos = (
+            detalhado["Princípio"].nunique() if len(detalhado) > 0 else 0
+        )
+        gasto_total = float(selecoes["Valor gasto"].sum())
+        pontuacao_total = int(selecoes["Pontuação"].sum())
+
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric("Alunos com respostas", total_alunos)
+        c2.metric("Escolhas registradas", total_escolhas)
+        c3.metric("Princípios diferentes", principios_unicos)
+        c4.metric("Valor total gasto", f"{gasto_total:.0f} EC")
+        c5.metric("Pontuação total", pontuacao_total)
+
+        st.divider()
+
+        st.subheader("👤 Consulta por aluno")
+        nomes = selecoes["Aluno"].dropna().astype(str).tolist()
+
+        aluno_escolhido = st.selectbox(
+            "Selecione o aluno",
+            nomes,
+            key="consulta_principios_aluno"
+        )
+
+        registro = selecoes[
+            selecoes["Aluno"].astype(str) == str(aluno_escolhido)
+        ].iloc[0]
+
+        principios_aluno = registro["Princípios escolhidos"]
+
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            st.write("**Aluno:**")
+            st.write(registro["Aluno"])
+        with c2:
+            st.write("**EDP apresentado:**")
+            st.write(registro["EDP apresentado"] or "Não informado")
+        with c3:
+            st.metric("Valor gasto", f"{float(registro['Valor gasto']):.0f} EC")
+        with c4:
+            st.metric("Pontuação", int(registro["Pontuação"]))
+
+        st.metric("Quantidade de princípios escolhidos", len(principios_aluno))
+
+        if principios_aluno:
             st.success(
-                "✅ Validação concluída e a coluna **Respostas acertadas** "
-                "foi atualizada na aba Gabarito."
+                "Princípios escolhidos: " + ", ".join(principios_aluno)
             )
+
+            detalhes_aluno = detalhado[
+                detalhado["Aluno"].astype(str) == str(aluno_escolhido)
+            ].copy()
+
+            if len(detalhes_aluno) > 0:
+                detalhes_aluno["Valor"] = detalhes_aluno["Valor"].map(
+                    lambda x: f"{float(x):.0f} EC"
+                )
+
             st.dataframe(
-                resultado,
+                detalhes_aluno[
+                    ["Princípio", "Valor", "Pontuação"]
+                ],
+                use_container_width=True,
+                hide_index=True
+            )
+        else:
+            st.warning("Este aluno não informou princípios no formulário.")
+
+        st.divider()
+
+        st.subheader("📋 Todas as escolhas da turma")
+        tabela_turma = selecoes[
+            [
+                "Aluno",
+                "EDP apresentado",
+                "Princípios escolhidos",
+                "Quantidade",
+                "Valor gasto",
+                "Pontuação",
+            ]
+        ].copy()
+
+        tabela_turma["Princípios escolhidos"] = tabela_turma[
+            "Princípios escolhidos"
+        ].apply(lambda x: ", ".join(x))
+
+        tabela_turma["Valor gasto"] = tabela_turma["Valor gasto"].map(
+            lambda x: f"{float(x):.0f} EC"
+        )
+
+        st.dataframe(
+            tabela_turma,
+            use_container_width=True,
+            hide_index=True
+        )
+
+        st.divider()
+
+        st.subheader("📊 Frequência de escolha dos princípios")
+        if len(detalhado) > 0:
+            frequencia = (
+                detalhado.groupby("Princípio")
+                .agg(
+                    **{
+                        "Número de escolhas": ("Princípio", "size"),
+                        "Valor unitário": ("Valor", "first"),
+                        "Pontuação unitária": ("Pontuação", "first"),
+                    }
+                )
+                .reset_index()
+                .sort_values(
+                    ["Número de escolhas", "Princípio"],
+                    ascending=[False, True]
+                )
+            )
+
+            frequencia["Valor unitário"] = frequencia["Valor unitário"].map(
+                lambda x: f"{float(x):.0f} EC"
+            )
+
+            st.dataframe(
+                frequencia,
                 use_container_width=True,
                 hide_index=True
             )
 
-            total_3 = int((resultado["Respostas acertadas"] == 3).sum())
-            total_2 = int((resultado["Respostas acertadas"] == 2).sum())
-            total_1 = int((resultado["Respostas acertadas"] == 1).sum())
-            total_0 = int((resultado["Respostas acertadas"] == 0).sum())
-
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("3/3", total_3)
-            c2.metric("2/3", total_2)
-            c3.metric("1/3", total_1)
-            c4.metric("0/3", total_0)
-
             st.caption(
-                "A coluna Respostas acertadas é gravada permanentemente "
-                "na aba Gabarito do EDP_MARKET.xlsx."
+                "Pontuação: 1 ponto para P24 e P37; 5 pontos para "
+                "P22, P39, P41, P60, P30, P02 e P46; 2 pontos para os demais EPDs."
             )
 
 elif menu == "📊 Portfólio":
