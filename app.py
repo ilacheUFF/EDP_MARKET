@@ -1628,3 +1628,82 @@ elif menu == "📊 Portfólio":
                 )
             }
         )
+
+# ============================================================
+# VALIDAÇÃO
+# ============================================================
+
+elif menu == "✅ Validação":
+    st.title("✅ Validação das respostas")
+    st.caption(
+        "Compara as respostas do arquivo Respostas.xlsx com os valores "
+        "calculados do Gabarito. As colunas E:G do Gabarito não são alteradas."
+    )
+
+    st.info(
+        "📌 Critério: uma resposta é considerada correta quando "
+        f"|resposta − gabarito| < {LIMITE_ERRO}. "
+        "A coluna 'Respostas acertadas' recebe 1, 2 ou 3 quando houver "
+        "acertos; permanece -1 quando não houver nenhum acerto."
+    )
+
+    if not ARQUIVO_FORMULARIO.exists():
+        st.error(
+            f"❌ O arquivo **{ARQUIVO_FORMULARIO.name}** não foi encontrado "
+            "na mesma pasta do aplicativo."
+        )
+    elif not ARQUIVO.exists():
+        st.error(
+            f"❌ O arquivo **{ARQUIVO.name}** não foi encontrado "
+            "na mesma pasta do aplicativo."
+        )
+    else:
+        if st.button("🔎 VALIDAR RESPOSTAS", type="primary"):
+            with st.spinner("Validando respostas..."):
+                resultado, erro = validar_respostas_formulario()
+
+            if erro:
+                st.error(f"❌ {erro}")
+            else:
+                st.success(
+                    "✅ Validação concluída. A coluna 'Respostas acertadas' "
+                    "foi atualizada no Gabarito."
+                )
+                st.cache_data.clear()
+
+                if resultado is not None and not resultado.empty:
+                    c1, c2, c3, c4 = st.columns(4)
+                    c1.metric("EDPs no gabarito", len(resultado))
+                    c2.metric(
+                        "1 acerto",
+                        int((resultado["Respostas acertadas"] == 1).sum())
+                    )
+                    c3.metric(
+                        "2 acertos",
+                        int((resultado["Respostas acertadas"] == 2).sum())
+                    )
+                    c4.metric(
+                        "3 acertos",
+                        int((resultado["Respostas acertadas"] == 3).sum())
+                    )
+
+                    st.divider()
+                    st.subheader("📋 Resultado da validação")
+
+                    tabela = resultado.copy()
+                    tabela["Situação"] = tabela["Situação"].replace(
+                        "Não validado / nenhum acerto",
+                        "❌ Nenhum acerto / -1"
+                    )
+
+                    st.dataframe(
+                        tabela,
+                        use_container_width=True,
+                        hide_index=True
+                    )
+
+                    st.caption(
+                        "Os valores de E, F e G do Gabarito permanecem "
+                        "inalterados. Somente a coluna H é atualizada."
+                    )
+
